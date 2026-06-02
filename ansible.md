@@ -107,6 +107,10 @@ When you have multiple tasks to run against a server, you write them in a file â
 
 ---
 
+## If we pass any data while laumchin ec2 in user_data section, we could find logs related to that in the below path
+```
+sudo tail -f /var/log/cloud-init-output.log
+```
 ## YAML Basics
 
 Playbooks are written in YAML. It's just a structured way to write key-value data â€” like a form.
