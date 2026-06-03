@@ -397,6 +397,191 @@ When each item needs its own properties, use inline maps with `item.key`:
 
 ---
 
+## Filters
+
+Ansible doesn't let you write custom functions, but it ships with a lot of built-in filters for manipulating data. Syntax: `{{ variable | filter }}`.
+
+```yaml
+  vars:
+    topics: "Linux, Shell, Ansible, Terraform"
+    full_name: "Sivakumar Reddy M"
+    ip_address: "178.90.78.17"
+    tagMap:
+      name: Ansible
+      project: roboshop
+      environment: dev
+    tagsList:
+    - { key: "name",        value: "Ansible" }
+    - { key: "project",     value: "roboshop" }
+    - { key: "environment", value: "dev" }
+
+  tasks:
+  - name: string to list
+    debug:
+      msg: "{{ topics | split(',') }}"
+
+  - name: default value if variable not defined
+    debug:
+      msg: "Hi {{ GREETING | default('Good Morning') }}"
+
+  - name: map to list
+    debug:
+      msg: "{{ tagMap | dict2items }}"
+
+  - name: list to map
+    debug:
+      msg: "{{ tagsList | items2dict }}"
+
+  - name: uppercase
+    debug:
+      msg: "{{ full_name | upper }}"
+
+  - name: lowercase
+    debug:
+      msg: "{{ full_name | lower }}"
+
+  - name: validate ipv4
+    debug:
+      msg: "{{ ip_address | ansible.utils.ipv4 }}"
+```
+
+| Filter | What it does |
+|--------|-------------|
+| `split(',')` | Split string into list by delimiter |
+| `default('val')` | Use fallback if variable is undefined |
+| `dict2items` | Convert map → list of `{key, value}` pairs |
+| `items2dict` | Convert list of `{key, value}` pairs → map |
+| `upper` / `lower` | Change string case |
+| `ansible.utils.ipv4` | Validate/filter IPv4 addresses |
+
+---
+
+## shell vs command
+
+When there's no Ansible module for what you need, you can run raw Linux commands. Two modules for this:
+
+| | `shell` | `command` |
+|-|---------|-----------|
+| Pipes (`\|`) | Yes | No |
+| Redirections (`>`, `>>`) | Yes | No |
+| Shell variables (`$VAR`) | Yes | No |
+| Use when | You need pipes or redirections | Simple command, no shell features |
+
+```yaml
+  tasks:
+  - name: needs pipe — use shell
+    shell: cat /etc/passwd | grep root
+
+  - name: redirect output to file
+    shell: ls -ltr > /tmp/files.txt
+
+  - name: simple command — no pipe needed
+    command: id roboshop
+```
+
+**Rule of thumb:** prefer `command` when you don't need shell features — it's safer. Use `shell` only when you need pipes or redirections.
+
+---
+
+## register
+
+Captures the output of a task into a variable, so you can use it in later tasks — same idea as `VAR=$(command)` in shell.
+
+```yaml
+  tasks:
+  - name: run command and capture output
+    shell: cat /etc/passwd | grep root
+    register: users_output
+
+  - name: use the captured output
+    debug:
+      msg: "{{ users_output }}"
+```
+
+`users_output` is a map with keys like `.stdout`, `.stderr`, `.rc` (return code), `.stdout_lines`.
+
+---
+
+## Error Handling
+
+By default Ansible stops the whole play when any task fails. Use `ignore_errors: true` to continue even if a task fails — useful when failure is expected and you want to branch on it.
+
+```yaml
+  tasks:
+  - name: check if roboshop user exists
+    command: id roboshop
+    register: user_output
+    ignore_errors: true          # don't stop if user doesn't exist
+
+  - name: create user only if missing
+    command: useradd roboshop
+    when: user_output.rc != 0   # rc=0 means success, non-zero means failed
+```
+
+Flow: run `id roboshop` → capture result → if it failed (rc != 0) → create the user.
+
+---
+
+## Idempotency
+
+Ansible **modules** are idempotent by default — run the same playbook 10 times, the result is the same. The `user:` module checks if the user exists before creating:
+
+```yaml
+  tasks:
+  - name: create expense user
+    user:
+      name: expense    # same as useradd expense, but idempotent
+```
+
+When you use `shell` or `command`, **you** are responsible for idempotency — Ansible can't know what your shell command does. The `register` + `when` + `ignore_errors` pattern above is the standard way to handle it manually.
+
+---
+
+## Real-world: AWS EC2 + Route53
+
+Ansible has AWS modules (`amazon.aws.*`) so you can provision infrastructure the same way you configure servers. From `roboshop.yaml`:
+
+```yaml
+- name: roboshop instances management
+  hosts: local
+  connection: local
+  vars:
+    instances: ["mongodb", "redis", "mysql", "rabbitmq", "catalogue", "user", "cart", "shipping", "payment", "frontend"]
+    action: create          # change to "delete" to tear down
+  tasks:
+  - name: create ec2 instances
+    amazon.aws.ec2_instance:
+      instance_type: t3.micro
+      name: "roboshop-{{ item }}"
+      image_id: "{{ image_id }}"
+    loop: "{{ instances }}"
+    register: ec2_output
+    when: action == "create"
+
+  - name: create r53 DNS records
+    amazon.aws.route53:
+      state: present
+      zone: "{{ domain_name }}"
+      record: "{{ item.item }}.{{ domain_name }}"   # mongodb.daws90s.shop
+      type: A
+      value: "{{ item.instances[0].private_ip_address }}"
+    loop: "{{ ec2_output.results }}"
+    when: action == "create"
+```
+
+Key ideas:
+- `register: ec2_output` captures the created instance data
+- `ec2_output.results` is a list — one entry per loop iteration
+- `item.item` is the original loop value (`mongodb`, `redis`, etc.), `item.instances[0]` is the EC2 response
+- Multiple `when` conditions — all must be true (AND logic):
+  ```yaml
+  when:
+  - item.item == "frontend"
+  - action == "create"
+  ```
+
+---
+
 ## Quick Reference
 
 | Concept | One-liner |
@@ -417,3 +602,10 @@ When each item needs its own properties, use inline maps with `item.key`:
 | `ansible_facts` | Auto-collected system info (OS, IP, arch, etc.) |
 | `loop:` | Repeat a task over a list; current item is `{{ item }}` |
 | `become: yes` | Run task with sudo / privilege escalation |
+| Filters | Built-in data manipulation functions (`split`, `upper`, `default`, etc.) |
+| `shell` module | Run Linux command with full shell (pipes, redirections) |
+| `command` module | Run Linux command without shell features — safer |
+| `register` | Capture task output into a variable for later use |
+| `ignore_errors: true` | Continue play even if this task fails |
+| `.rc` | Return code from a registered task — 0 = success, non-zero = fail |
+| Idempotency | Modules handle it automatically; `shell`/`command` — you handle manually |
