@@ -127,6 +127,8 @@ date: 01-jun-2026
 tasks:
   - name: install nginx
   - name: start nginx
+  also
+  
 ```
 
 **Map / nested** — indent under a key:
