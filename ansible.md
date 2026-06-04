@@ -576,6 +576,79 @@ Key ideas:
 
 ---
 
+## ansible.cfg
+
+Ansible looks for its config file in this order — first match wins:
+
+```
+1. ANSIBLE_CONFIG   (environment variable pointing to a file)
+2. ./ansible.cfg    (current working directory)
+3. ~/.ansible.cfg   (home directory)
+4. /etc/ansible/ansible.cfg  (system default)
+```
+
+The most common setup is a project-level `ansible.cfg` in the same folder as your playbooks:
+
+```ini
+[defaults]
+inventory = ./inventory.ini        # so you don't have to pass -i every time
+log_path  = /var/log/roboshop/ansible.log
+```
+
+Without this, you'd have to type `ansible-playbook -i inventory.ini playbook.yaml` every run. With it, just `ansible-playbook playbook.yaml`.
+
+---
+
+## Templates
+
+A template is a config file with **placeholders** instead of hardcoded values. Ansible fills in the actual values at deploy time using variables. Template files use the `.j2` extension (Jinja2).
+
+**Why templates?** Config files often have values that change per environment (dev/staging/prod) or per service — hostnames, ports, URLs. Rather than maintaining separate files for each, you write one template and let variables do the work.
+
+```
+template file (.j2)  +  variables  →  final config file on the server
+```
+
+### Example — systemd service file
+
+`catalogue.service.j2`:
+```ini
+[Unit]
+Description = Catalogue Service
+
+[Service]
+User=roboshop
+Environment=MONGO=true
+Environment=MONGO_URL="mongodb://{{ MONGODB_HOST }}:27017/catalogue"
+ExecStart=/bin/node /app/server.js
+SyslogIdentifier=catalogue
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`cart.service.j2`:
+```ini
+[Service]
+User=roboshop
+Environment=REDIS_HOST={{ REDIS_HOST }}
+Environment=CATALOGUE_HOST={{ CATALOGUE_HOST }}
+Environment=CATALOGUE_PORT=8080
+ExecStart=/bin/node /app/server.js
+```
+
+`{{ MONGODB_HOST }}`, `{{ REDIS_HOST }}`, `{{ CATALOGUE_HOST }}` are placeholders — Ansible replaces them with real values from your variables.
+
+### Using the template module
+
+```yaml
+  tasks:
+  - name: deploy catalogue service file
+    template:
+      src: catalogue.service.j2    # template on your machine
+      dest: /etc/systemd/system/catalogue.service   # destination on the server
+```
+---
 ## Quick Reference
 
 | Concept | One-liner |
@@ -596,6 +669,9 @@ Key ideas:
 | `ansible_facts` | Auto-collected system info (OS, IP, arch, etc.) |
 | `loop:` | Repeat a task over a list; current item is `{{ item }}` |
 | `become: yes` | Run task with sudo / privilege escalation |
+| `ansible.cfg` | Config file — sets inventory, log path, defaults so you don't repeat CLI flags |
+| `.j2` template | Config file with `{{ variable }}` placeholders filled at deploy time |
+| `template` module | Renders a `.j2` file and copies it to the target server |
 | Filters | Built-in data manipulation functions (`split`, `upper`, `default`, etc.) |
 | `shell` module | Run Linux command with full shell (pipes, redirections) |
 | `command` module | Run Linux command without shell features — safer |
@@ -603,3 +679,7 @@ Key ideas:
 | `ignore_errors: true` | Continue play even if this task fails |
 | `.rc` | Return code from a registered task — 0 = success, non-zero = fail |
 | Idempotency | Modules handle it automatically; `shell`/`command` — you handle manually |
+
+---
+
+
