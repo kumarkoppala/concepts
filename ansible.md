@@ -582,6 +582,345 @@ Key ideas:
 
 ---
 
+## ansible.cfg
+
+Ansible looks for its config file in this order — first match wins:
+
+```
+1. ANSIBLE_CONFIG   (environment variable pointing to a file)
+2. ./ansible.cfg    (current working directory)
+3. ~/.ansible.cfg   (home directory)
+4. /etc/ansible/ansible.cfg  (system default)
+```
+
+The most common setup is a project-level `ansible.cfg` in the same folder as your playbooks:
+
+```ini
+[defaults]
+inventory = ./inventory.ini        # so you don't have to pass -i every time
+log_path  = /var/log/roboshop/ansible.log
+```
+
+Without this, you'd have to type `ansible-playbook -i inventory.ini playbook.yaml` every run. With it, just `ansible-playbook playbook.yaml`.
+
+---
+
+## Templates
+
+A template is a config file with **placeholders** instead of hardcoded values. Ansible fills in the actual values at deploy time using variables. Template files use the `.j2` extension (Jinja2).
+
+**Why templates?** Config files often have values that change per environment (dev/staging/prod) or per service — hostnames, ports, URLs. Rather than maintaining separate files for each, you write one template and let variables do the work.
+
+```
+template file (.j2)  +  variables  →  final config file on the server
+```
+
+### Example — systemd service file
+
+`catalogue.service.j2`:
+```ini
+[Unit]
+Description = Catalogue Service
+
+[Service]
+User=roboshop
+Environment=MONGO=true
+Environment=MONGO_URL="mongodb://{{ MONGODB_HOST }}:27017/catalogue"
+ExecStart=/bin/node /app/server.js
+SyslogIdentifier=catalogue
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`cart.service.j2`:
+```ini
+[Service]
+User=roboshop
+Environment=REDIS_HOST={{ REDIS_HOST }}
+Environment=CATALOGUE_HOST={{ CATALOGUE_HOST }}
+Environment=CATALOGUE_PORT=8080
+ExecStart=/bin/node /app/server.js
+```
+
+`{{ MONGODB_HOST }}`, `{{ REDIS_HOST }}`, `{{ CATALOGUE_HOST }}` are placeholders — Ansible replaces them with real values from your variables.
+
+### Using the template module
+
+```yaml
+  tasks:
+  - name: deploy catalogue service file
+    template:
+      src: catalogue.service.j2    # template on your machine
+      dest: /etc/systemd/system/catalogue.service   # destination on the server
+```
+---
+
+## Tags
+
+Tags let you run or skip specific tasks without changing the playbook. You add a `tags:` list to a task, then pass `--tags` or `--skip-tags` on the CLI.
+
+```yaml
+- name: check catalogue schema
+  shell: mongosh --host "{{ MONGODB_HOST }}" --eval 'db.getMongo().getDBNames().indexOf("catalogue")'
+  register: catalogue_output
+  tags:
+  - mongodb
+
+- name: load products
+  shell: mongosh --host "{{ MONGODB_HOST }}" </app/db/master-data.js
+  when: catalogue_output.stdout | int < 0
+  tags:
+  - mongodb
+```
+
+```bash
+ansible-playbook playbook.yaml --tags mongodb        # run only tasks tagged "mongodb"
+ansible-playbook playbook.yaml --skip-tags mongodb   # run everything except "mongodb" tasks
+ansible-playbook playbook.yaml --list-tags            # list all available tags
+```
+
+Real use case from `roboshop-ansible`: the MongoDB data-loading tasks are tagged `mongodb` so you can re-run only them after a schema change without re-running the entire playbook.
+
+---
+
+## Roles
+
+A **role** is a standardised directory structure for organising a playbook into reusable pieces — tasks, variables, files, templates, handlers, and dependencies all live in well-known folders. Ansible auto-loads `main.yaml` from each folder.
+
+```
+roles/
+  catalogue/
+    tasks/        ← main.yaml (required — what the role does)
+    vars/         ← main.yaml (role-specific variables)
+    files/        ← static files referenced by copy module
+    templates/    ← .j2 template files
+    handlers/     ← main.yaml (triggered by notify)
+    meta/         ← main.yaml (dependencies — other roles to run first)
+    defaults/     ← main.yaml (lowest-priority default vars)
+```
+
+**Using a role in a play:**
+
+```yaml
+# roboshop.yaml
+- name: configure "{{ component }}" server
+  hosts: "{{ component }}"
+  become: yes
+  roles:
+  - "{{ component }}"    # loads roles/mongodb/, roles/redis/, etc.
+```
+
+Run it:
+```bash
+ansible-playbook -e "component=mongodb" roboshop.yaml
+ansible-playbook -e "component=redis"   roboshop.yaml
+```
+
+**Role dependencies (meta/main.yaml):**
+
+A role can declare that it depends on another role. The dependency is always run first.
+
+```yaml
+# roles/catalogue/meta/main.yaml
+dependencies:
+  - role: common    # common role runs before catalogue role
+```
+
+**Calling a specific task file from another role:**
+
+```yaml
+# instead of running all of common's main.yaml, run just one file
+- name: application setup
+  import_role:
+    name: common
+    tasks_from: app-setup    # runs roles/common/tasks/app-setup.yaml
+```
+
+---
+
+## Handlers
+
+A **handler** is a task that only runs when it's explicitly notified by another task — and only once, at the end of the play, even if notified multiple times. This is perfect for service restarts: you don't want to restart nginx after every config file change if there are five changes; you want to restart it once at the end.
+
+**Define a handler** in `roles/<role>/handlers/main.yaml`:
+
+```yaml
+# roles/frontend/handlers/main.yaml
+- name: restart nginx
+  service:
+    name: nginx
+    state: restarted
+    enabled: yes
+```
+
+**Trigger it** with `notify:` in a task:
+
+```yaml
+# roles/frontend/tasks/main.yaml
+- name: copy nginx conf
+  template:
+    src: nginx.conf.j2
+    dest: /etc/nginx/nginx.conf
+  notify: restart nginx    # name must match handler name exactly
+```
+
+How it works:
+- `notify` queues the handler name — it doesn't run immediately
+- If the task didn't change anything (idempotent run), notify is not triggered
+- All queued handlers run once at the end of the play
+- If the same handler is notified 5 times, it still only runs once
+
+---
+
+## include_role vs import_role
+
+Both load a role inside a task list, but they differ in **when the role is parsed**.
+
+| | `import_role` | `include_role` |
+|---|---|---|
+| Parsed | Before execution (static) | At runtime when the task runs (dynamic) |
+| Tags cascade to role tasks | Yes | No |
+| `when:` applies to | All tasks inside the role | Only the include statement itself |
+| Supports `loop:` | No | Yes |
+
+```yaml
+# static — parsed before run; tags and when: apply to all tasks inside common
+- name: application setup
+  import_role:
+    name: common
+    tasks_from: app-setup
+
+# dynamic — parsed at runtime; useful with loops
+- name: setup for multiple items
+  include_role:
+    name: common
+  loop:
+  - item1
+  - item2
+```
+
+**When to use which:**
+
+- Use `import_role` (default choice) — tags work correctly, `when:` guards the whole role, and errors are caught before execution starts.
+- Use `include_role` when you need to loop over a role, or when the role name is determined dynamically at runtime.
+
+```yaml
+# from ansible-include-vs-import repo — demonstrates the difference
+- name: call common role
+  import_role:       # swap this for include_role to see behaviour differ
+    name: common
+  tags:
+  - hi
+  when: os == "RedHat"
+```
+
+With `import_role`: the `hi` tag is applied to every task inside `common`, and `when: os == "RedHat"` is checked for each task.  
+With `include_role`: the `hi` tag is ignored inside `common`, and `when:` only guards whether the include runs — tasks inside run regardless of the condition.
+
+---
+
+## Ansible Vault
+
+Ansible Vault encrypts sensitive files (passwords, API keys) so you can commit them to git safely. The encrypted file is still YAML but the content is AES-256 ciphertext.
+
+**Create an encrypted file:**
+
+```bash
+ansible-vault create vault.yaml     # opens editor, saves encrypted
+```
+
+**Common vault commands:**
+
+```bash
+ansible-vault create vault.yaml     # create new encrypted file
+ansible-vault edit vault.yaml       # edit (decrypts in memory, re-encrypts on save)
+ansible-vault view vault.yaml       # view without editing
+ansible-vault encrypt existing.yaml # encrypt a plain file in-place
+ansible-vault decrypt vault.yaml    # decrypt to plaintext (careful — don't commit)
+ansible-vault rekey vault.yaml      # change the vault password
+```
+
+An encrypted vault file looks like this (the content is ciphertext):
+
+```
+$ANSIBLE_VAULT;1.1;AES256
+34646533346337613336666539636130376230303734316135373730366461646438366431303163
+3231386464653064333037313039383566336665623165630a...
+```
+
+**Using vault in a playbook:**
+
+Store secrets in `group_vars/all/vault.yaml` (encrypted), plain vars in `group_vars/all/all.yaml`:
+
+```
+group_vars/
+  all/
+    all.yaml      ← plain variables (committed openly)
+    vault.yaml    ← encrypted secrets (committed, but unreadable without password)
+```
+
+**Running a playbook that uses vault:**
+
+```bash
+# prompt for password at runtime
+ansible-playbook roboshop.yaml --ask-vault-pass
+
+# read password from a file (for automation)
+ansible-playbook roboshop.yaml --vault-password-file ~/.vault_pass
+```
+
+The password file should be in `.gitignore` — never commit it.
+
+---
+
+## AWS Secrets Manager Integration
+
+Ansible Vault keeps secrets encrypted in your repo. For production, you often want secrets managed centrally in **AWS Secrets Manager** or **AWS SSM Parameter Store** instead — so secrets aren't in your repo at all and can be rotated without editing playbooks.
+
+**Fetch a secret from AWS SSM Parameter Store using the `aws_ssm` lookup:**
+
+```yaml
+- name: get DB password from SSM
+  debug:
+    msg: "{{ lookup('amazon.aws.aws_ssm', '/roboshop/mysql/password', region='us-east-1') }}"
+```
+
+**Fetch a secret from AWS Secrets Manager:**
+
+```yaml
+- name: get secret from Secrets Manager
+  debug:
+    msg: "{{ lookup('amazon.aws.aws_secret', 'roboshop/mysql', region='us-east-1') }}"
+```
+
+**Typical pattern** — store the fetched value in a variable and use it across tasks:
+
+```yaml
+- name: configure payment server
+  hosts: payment
+  vars:
+    DB_PASSWORD: "{{ lookup('amazon.aws.aws_ssm', '/roboshop/mysql/password', region='us-east-1') }}"
+  tasks:
+  - name: deploy payment config
+    template:
+      src: payment.conf.j2
+      dest: /etc/payment/config
+```
+
+**How it compares:**
+
+| | Ansible Vault | AWS Secrets Manager / SSM |
+|---|---|---|
+| Secrets location | Encrypted in your repo | AWS managed, outside repo |
+| Secret rotation | Manual — edit vault, redeploy | AWS handles rotation |
+| Access control | Anyone with vault password | IAM policies per secret |
+| Best for | Small teams, simple setups | Production, compliance requirements |
+
+The EC2 instance running Ansible needs an IAM role with `ssm:GetParameter` or `secretsmanager:GetSecretValue` permission — no keys needed.
+
+---
+
 ## Quick Reference
 
 | Concept | One-liner |
@@ -602,6 +941,9 @@ Key ideas:
 | `ansible_facts` | Auto-collected system info (OS, IP, arch, etc.) |
 | `loop:` | Repeat a task over a list; current item is `{{ item }}` |
 | `become: yes` | Run task with sudo / privilege escalation |
+| `ansible.cfg` | Config file — sets inventory, log path, defaults so you don't repeat CLI flags |
+| `.j2` template | Config file with `{{ variable }}` placeholders filled at deploy time |
+| `template` module | Renders a `.j2` file and copies it to the target server |
 | Filters | Built-in data manipulation functions (`split`, `upper`, `default`, etc.) |
 | `shell` module | Run Linux command with full shell (pipes, redirections) |
 | `command` module | Run Linux command without shell features — safer |
@@ -609,3 +951,25 @@ Key ideas:
 | `ignore_errors: true` | Continue play even if this task fails |
 | `.rc` | Return code from a registered task — 0 = success, non-zero = fail |
 | Idempotency | Modules handle it automatically; `shell`/`command` — you handle manually |
+| `tags:` | Label tasks so you can run/skip them selectively with `--tags` / `--skip-tags` |
+| `--tags` / `--skip-tags` | CLI flags to run only tagged tasks or exclude them |
+| Role | Standardised directory structure (`tasks/`, `vars/`, `handlers/`, `meta/`, etc.) for reusable playbook components |
+| `roles:` | Key in a play that loads one or more roles |
+| `meta/main.yaml` | Declares role dependencies — they run before the role itself |
+| Handler | Task that runs only when notified by another task, and only once per play |
+| `notify:` | Queues a handler by name when the task actually changes something |
+| `handlers/main.yaml` | Where handler definitions live inside a role |
+| `import_role` | Statically loads a role — tags cascade, `when:` applies to all tasks, no loops |
+| `include_role` | Dynamically loads a role at runtime — supports loops, tags don't cascade |
+| `tasks_from:` | Load a specific task file from a role instead of `main.yaml` |
+| Ansible Vault | AES-256 encryption for secrets files so they can be committed to git safely |
+| `ansible-vault create` | Create a new encrypted vault file |
+| `ansible-vault edit` | Edit an encrypted file (decrypts in memory, re-encrypts on save) |
+| `--ask-vault-pass` | Prompt for vault password at playbook runtime |
+| `--vault-password-file` | Read vault password from a file (for CI/automation) |
+| `aws_ssm` lookup | Fetch secrets from AWS SSM Parameter Store at playbook runtime |
+| `aws_secret` lookup | Fetch secrets from AWS Secrets Manager at playbook runtime |
+
+---
+
+
