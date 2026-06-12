@@ -385,6 +385,145 @@ Name = "${var.project}-${var.environment}-${var.instances[count.index]}"
 
 ---
 
+## output Block
+
+`output` prints values after `terraform apply` and exposes them to other modules.
+
+```hcl
+output "ec2_instance_output" {
+  value = aws_instance.roboshop
+}
+```
+
+```bash
+terraform output                        # show all outputs
+terraform output ec2_instance_output    # show a specific output
+```
+
+Outputs are also how modules pass values to the code that calls them — the caller reads them as `module.name.output_name`.
+
+---
+
+## Functions
+
+Terraform has many built-in functions. You can't create custom ones — only use what's provided.
+
+### contains — check if an element exists
+
+```hcl
+contains(["t3.micro", "t3.small", "t3.medium"], var.instance_type)
+# → true or false
+
+contains(keys(var.instances), "frontend")
+# → true if "frontend" is a key in the map
+```
+
+Used in variable validation and in conditionals (ternary + count) to check whether something should be created.
+
+### index — find position of an element
+
+```hcl
+index(var.instances, "frontend")   # → 9 (zero-based position in the list)
+```
+
+### join and split — string ↔ list
+
+```hcl
+join(" ", ["Sivakumar", "Reddy", "Mettukuru"])
+# → "Sivakumar Reddy Mettukuru"
+
+split(" ", "Sivakumar Reddy Mettukuru")
+# → ["Sivakumar", "Reddy", "Mettukuru"]
+```
+
+### length — count items
+
+```hcl
+length(var.instances)   # number of items in a list or map
+```
+
+### keys — get all keys of a map
+
+```hcl
+keys(var.instances)
+# → ["cart", "catalogue", "frontend", "mongodb", "mysql", ...]
+```
+
+### merge — combine maps
+
+Right side wins on duplicate keys:
+
+```hcl
+merge(
+  { a = "b", c = "d" },
+  { c = "z", e = "f" }
+)
+# → { a = "b", c = "z", e = "f" }
+```
+
+**Real pattern — common tags + resource-specific tags:**
+
+Instead of duplicating `Project` and `Environment` in every resource, put shared tags in a variable and merge:
+
+```hcl
+variable "common_tags" {
+  default = {
+    Project     = "roboshop"
+    Environment = "dev"
+  }
+}
+```
+
+```hcl
+tags = merge(
+  var.common_tags,
+  {
+    Name      = "terraform-demo"
+    Component = "catalogue"
+  }
+)
+# → { Project = "roboshop", Environment = "dev", Name = "terraform-demo", Component = "catalogue" }
+```
+
+Change `common_tags` once, all resources pick it up.
+
+### lookup — get a value from a map by key
+
+```hcl
+lookup(aws_instance.roboshop, "frontend").public_ip
+# → the public IP of the frontend instance
+```
+
+Useful when iterating over a `for_each` resource group and you need to pull a specific entry by name.
+
+---
+
+## lifecycle
+
+Terraform's default behaviour when a resource attribute changes: **destroy first, then recreate**. This can cause downtime — if a security group is renamed, Terraform tries to delete the old one first, but it's still attached to an EC2 instance, so the deletion fails.
+
+`create_before_destroy` flips the order:
+
+```hcl
+resource "aws_security_group" "roboshop" {
+  for_each = var.instances
+  name     = "${var.project}-${var.environment}-${each.key}"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+```
+
+What happens when the SG name changes:
+1. New SG created with the new name
+2. Instance's SG attachment updated to point at the new SG
+3. Old SG destroyed (safely — nothing is attached to it)
+
+Without this, step 3 runs first and fails because the instance still holds a reference.
+
+---
+
 ## Real-World Example: Multiple EC2 Instances + Security Groups
 
 ```hcl
