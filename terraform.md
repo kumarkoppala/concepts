@@ -287,9 +287,63 @@ vpc_security_group_ids = [
 
 `aws_security_group.roboshop` is now a list (because it also has `count = 4`), so you access it by index.
 
-### for loop
+### for_each — map-based loops
 
-Transform a list or map into a new list or map:
+`count` works on lists and tracks resources by position number. `for_each` works on **maps** and tracks resources by their key name — which makes updates much safer.
+
+The special variable `each` gives you:
+- `each.key` — the map key (e.g. `"mongodb"`)
+- `each.value` — the map value (e.g. `{ instance_type = "t3.micro" }`)
+
+```hcl
+# variables.tf
+variable "instances" {
+  type = map
+  default = {
+    mongodb  = { instance_type = "t3.micro" }
+    redis    = { instance_type = "t3.micro" }
+    mysql    = { instance_type = "t3.micro" }
+    frontend = { instance_type = "t3.micro" }
+  }
+}
+```
+
+```hcl
+resource "aws_instance" "roboshop" {
+  for_each      = var.instances
+  ami           = var.ami_id
+  instance_type = each.value.instance_type
+
+  tags = {
+    Name = "${var.project}-${var.environment}-${each.key}"
+    # → "roboshop-dev-mongodb", "roboshop-dev-frontend", etc.
+  }
+}
+```
+
+`aws_instance.roboshop` is now a **map** of resources keyed by component name. Reference an entry by key:
+
+```hcl
+vpc_security_group_ids = [
+  aws_security_group.roboshop[each.key].id,
+  aws_security_group.common.id
+]
+```
+
+**count vs for_each:**
+
+| | `count` | `for_each` |
+|---|---|---|
+| Input | list | map |
+| Current item | `count.index` (number) | `each.key` / `each.value` |
+| Resource address | `aws_instance.x[0]` | `aws_instance.x["mongodb"]` |
+| Remove middle item | renumbers everything below it | only removes that one key |
+
+The last point is the big one. With `count`, removing `redis` from position 1 causes Terraform to see all resources below it as shifted — it wants to destroy and recreate them. With `for_each`, removing `redis` only removes `redis`. For real infrastructure, always prefer `for_each`.
+
+### for expression
+
+Transform a list or map into a new list or map inline:
 
 ```hcl
 locals {
