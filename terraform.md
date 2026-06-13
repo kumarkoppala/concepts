@@ -287,36 +287,58 @@ vpc_security_group_ids = [
 
 `aws_security_group.roboshop` is now a list (because it also has `count = 4`), so you access it by index.
 
-### for loop
+### for_each — map-based loops
 
-Transform a list or map into a new list or map:
+`count` works on lists and tracks resources by position number. `for_each` works on **maps** and tracks resources by their key name — which makes updates much safer.
 
-```hcl
-locals {
-  upper_instances = [for i in var.instances : upper(i)]
-  # ["MONGODB", "REDIS", "MYSQL", "RABBITMQ"]
-}
-```
-
-### dynamic block
-
-When an argument inside a resource block needs to repeat (like multiple `ingress` rules in a security group), use `dynamic`:
+The special variable `each` gives you:
+- `each.key` — the map key (e.g. `"mongodb"`)
+- `each.value` — the map value (e.g. `{ instance_type = "t3.micro" }`)
 
 ```hcl
-resource "aws_security_group" "example" {
-  dynamic "ingress" {
-    for_each = var.ingress_rules
-    content {
-      from_port   = ingress.value.from_port
-      to_port     = ingress.value.to_port
-      protocol    = ingress.value.protocol
-      cidr_blocks = ingress.value.cidr_blocks
-    }
+# variables.tf
+variable "instances" {
+  type = map
+  default = {
+    mongodb  = { instance_type = "t3.micro" }
+    redis    = { instance_type = "t3.micro" }
+    mysql    = { instance_type = "t3.micro" }
+    frontend = { instance_type = "t3.micro" }
   }
 }
 ```
 
-`dynamic` generates one `ingress {}` block per item in `var.ingress_rules`. The inner `content {}` block is the template for each repetition.
+```hcl
+resource "aws_instance" "roboshop" {
+  for_each      = var.instances
+  ami           = var.ami_id
+  instance_type = each.value.instance_type
+
+  tags = {
+    Name = "${var.project}-${var.environment}-${each.key}"
+    # → "roboshop-dev-mongodb", "roboshop-dev-frontend", etc.
+  }
+}
+```
+
+`aws_instance.roboshop` is now a **map** of resources keyed by component name. Reference an entry by key:
+
+```hcl
+vpc_security_group_ids = [
+  aws_security_group.roboshop[each.key].id,
+  aws_security_group.common.id
+]
+```
+
+**count vs for_each:**
+
+| | `count` | `for_each` |
+|---|---|---|
+| Input | list | map |
+| Current item | `count.index` (number) | `each.key` / `each.value` |
+| Resource address | `aws_instance.x[0]` | `aws_instance.x["mongodb"]` |
+| Remove middle item | renumbers everything below it | only removes that one key |
+
 
 ---
 
@@ -331,47 +353,197 @@ Name = "${var.project}-${var.environment}-${var.instances[count.index]}"
 
 ---
 
-## Real-World Example: Multiple EC2 Instances + Security Groups
+## output Block
+
+`output` prints values after `terraform apply` and exposes them to other modules.
+
+```hcl
+output "ec2_instance_output" {
+  value = aws_instance.roboshop
+}
+```
+
+```bash
+terraform output                        # show all outputs
+terraform output ec2_instance_output    # show a specific output
+```
+
+Outputs are also how modules pass values to the code that calls them — the caller reads them as `module.name.output_name`.
+
+---
+
+## Functions
+
+Terraform has many built-in functions. You can't create custom ones — only use what's provided.
+
+### contains — check if an element exists
+
+```hcl
+contains(["t3.micro", "t3.small", "t3.medium"], var.instance_type)
+# → true or false
+
+contains(keys(var.instances), "frontend")
+# → true if "frontend" is a key in the map
+```
+
+Used in variable validation and in conditionals (ternary + count) to check whether something should be created.
+
+### index — find position of an element
+
+```hcl
+index(var.instances, "frontend")   # → 9 (zero-based position in the list)
+```
+
+### join and split — string ↔ list
+
+```hcl
+join(" ", ["Sivakumar", "Reddy", "Mettukuru"])
+# → "Sivakumar Reddy Mettukuru"
+
+split(" ", "Sivakumar Reddy Mettukuru")
+# → ["Sivakumar", "Reddy", "Mettukuru"]
+```
+
+### length — count items
+
+```hcl
+length(var.instances)   # number of items in a list or map
+```
+
+### keys — get all keys of a map
+
+```hcl
+keys(var.instances)
+# → ["cart", "catalogue", "frontend", "mongodb", "mysql", ...]
+```
+
+### merge — combine maps
+
+Right side wins on duplicate keys:
+
+```hcl
+merge(
+  { a = "b", c = "d" },
+  { c = "z", e = "f" }
+)
+# → { a = "b", c = "z", e = "f" }
+```
+
+**Real pattern — common tags + resource-specific tags:**
+
+Instead of duplicating `Project` and `Environment` in every resource, put shared tags in a variable and merge:
+
+```hcl
+variable "common_tags" {
+  default = {
+    Project     = "roboshop"
+    Environment = "dev"
+  }
+}
+```
+
+```hcl
+tags = merge(
+  var.common_tags,
+  {
+    Name      = "terraform-demo"
+    Component = "catalogue"
+  }
+)
+# → { Project = "roboshop", Environment = "dev", Name = "terraform-demo", Component = "catalogue" }
+```
+
+Change `common_tags` once, all resources pick it up.
+
+### lookup — get a value from a map by key
+
+```hcl
+lookup(aws_instance.roboshop, "frontend").public_ip
+# → the public IP of the frontend instance
+```
+
+Useful when iterating over a `for_each` resource group and you need to pull a specific entry by name.
+
+---
+
+## lifecycle
+
+Terraform's default behaviour when a resource attribute changes: **destroy first, then recreate**. This can cause downtime — if a security group is renamed, Terraform tries to delete the old one first, but it's still attached to an EC2 instance, so the deletion fails.
+
+`create_before_destroy` flips the order:
+
+```hcl
+resource "aws_security_group" "roboshop" {
+  for_each = var.instances
+  name     = "${var.project}-${var.environment}-${each.key}"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+```
+
+What happens when the SG name changes:
+1. New SG created with the new name
+2. Instance's SG attachment updated to point at the new SG
+3. Old SG destroyed (safely — nothing is attached to it)
+
+Without this, step 3 runs first and fails because the instance still holds a reference.
+
+---
+
+## Real-World Example: Roboshop — EC2 + SG + Route53
+
+All 10 roboshop components, each with its own EC2 instance, its own security group, a private DNS record, and a public DNS record for just the frontend.
 
 ```hcl
 # variables.tf
 variable "instances" {
-  type    = list
-  default = ["mongodb", "redis", "mysql", "rabbitmq"]
+  type = map
+  default = {
+    mongodb   = { instance_type = "t3.micro" }
+    redis     = { instance_type = "t3.micro" }
+    mysql     = { instance_type = "t3.micro" }
+    rabbitmq  = { instance_type = "t3.micro" }
+    catalogue = { instance_type = "t3.micro" }
+    user      = { instance_type = "t3.micro" }
+    cart      = { instance_type = "t3.micro" }
+    shipping  = { instance_type = "t3.micro" }
+    payment   = { instance_type = "t3.micro" }
+    frontend  = { instance_type = "t3.micro" }
+  }
 }
 
-variable "project" {
-  type    = string
-  default = "roboshop"
-}
-
-variable "environment" {
-  type    = string
-  default = "prod"
+variable "common_tags" {
+  default = {
+    Project     = "roboshop"
+    Environment = "dev"
+  }
 }
 ```
 
 ```hcl
 # main.tf
 resource "aws_instance" "roboshop" {
-  count         = 4
+  for_each      = var.instances
   ami           = var.ami_id
-  instance_type = var.instance_type
+  instance_type = each.value.instance_type
 
   vpc_security_group_ids = [
-    aws_security_group.roboshop[count.index].id,
+    aws_security_group.roboshop[each.key].id,
     aws_security_group.common.id
   ]
 
-  tags = {
-    Name = "${var.project}-${var.environment}-${var.instances[count.index]}"
-  }
+  tags = merge(var.common_tags, {
+    Name      = "${var.project}-${var.environment}-${each.key}"
+    Component = each.key
+  })
 }
 
 resource "aws_security_group" "roboshop" {
-  count       = 4
-  name        = "${var.project}-${var.environment}-${var.instances[count.index]}"
-  description = "Allow TLS inbound traffic and all outbound traffic"
+  for_each    = var.instances
+  name        = "${var.project}-${var.environment}-${each.key}"
+  description = "Allow traffic for ${each.key}"
 
   egress {
     from_port   = 0
@@ -380,14 +552,15 @@ resource "aws_security_group" "roboshop" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = {
-    Name = "${var.project}-${var.environment}-${var.instances[count.index]}"
+  tags = merge(var.common_tags, { Name = "${var.project}-${var.environment}-${each.key}" })
+
+  lifecycle {
+    create_before_destroy = true
   }
 }
 
 resource "aws_security_group" "common" {
-  name        = "${var.project}-${var.environment}-common"
-  description = "Shared security group for all roboshop instances"
+  name = "${var.project}-${var.environment}-common"
 
   egress {
     from_port   = 0
@@ -395,10 +568,47 @@ resource "aws_security_group" "common" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = merge(var.common_tags, { Name = "${var.project}-${var.environment}-common" })
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 ```
 
-Result: 4 EC2 instances + 4 per-service security groups + 1 common security group, all named consistently.
+```hcl
+# r53.tf — private DNS record for every component
+resource "aws_route53_record" "roboshop" {
+  for_each = aws_instance.roboshop
+  zone_id  = var.zone_id
+  name     = "${each.key}-${var.environment}.${var.domain_name}"
+  # → mongodb-dev.daws90s.shop, redis-dev.daws90s.shop, etc.
+  type    = "A"
+  ttl     = 1
+  records = [each.value.private_ip]
+}
+
+# public DNS record for frontend only — created conditionally
+resource "aws_route53_record" "frontend" {
+  count   = contains(keys(var.instances), "frontend") ? 1 : 0
+  zone_id = var.zone_id
+  name    = "${var.project}-${var.environment}.${var.domain_name}"
+  # → roboshop-dev.daws90s.shop
+  type    = "A"
+  ttl     = 1
+  records = [lookup(aws_instance.roboshop, "frontend").public_ip]
+}
+```
+
+```hcl
+# outputs.tf
+output "ec2_instance_output" {
+  value = aws_instance.roboshop
+}
+```
+
+What this creates: 10 EC2 instances + 10 per-component SGs + 1 common SG + 10 private Route53 records + 1 public Route53 record for the frontend. All consistently named, all tracked by Terraform state.
 
 ---
 
@@ -425,11 +635,23 @@ Result: 4 EC2 instances + 4 per-service security groups + 1 common security grou
 | `type = string/number/list/map` | Variable data types |
 | `validation` | Block to reject invalid variable values early |
 | Ternary | `condition ? "true-val" : "false-val"` — Terraform's only conditional |
-| `count` | Create N copies of a resource |
+| `count` | Create N copies of a resource; tracks by position number |
 | `count.index` | Zero-based index of the current copy |
-| `for` loop | Transform a list/map into another list/map |
-| `dynamic` | Generate repeated nested blocks (like multiple ingress rules) |
+| `for_each` | Create one resource per map entry; tracks by key name — safer than count |
+| `each.key` / `each.value` | Current map key and value inside a for_each resource |
 | String interpolation | `"${var.project}-${var.environment}"` — embed expressions in strings |
 | Resource reference | `aws_security_group.name.id` — use another resource's attribute |
+| `output` | Print a value after apply; expose values from modules |
+| `contains(list, val)` | Check if an element exists in a list — true/false |
+| `index(list, val)` | Find the position of an element in a list |
+| `join(sep, list)` | Combine a list into a string with a separator |
+| `split(sep, str)` | Split a string into a list |
+| `length(list/map)` | Count items in a list or map |
+| `keys(map)` | Get all keys of a map as a list |
+| `merge(map1, map2)` | Combine two maps; right side wins on duplicate keys |
+| `lookup(map, key)` | Get a value from a map by key |
+| `common_tags` pattern | Put shared tags in a variable, use `merge()` to add resource-specific ones |
+| `lifecycle` | Block that overrides Terraform's default resource update behaviour |
+| `create_before_destroy` | Create the replacement first, then destroy the old — prevents downtime |
 
 ---
